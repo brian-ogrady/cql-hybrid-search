@@ -1,0 +1,141 @@
+description: |
+  This is a template for live vector search testing.
+  The goals of this test are to:
+  1. establish basic recall metrics on a knn computed dataset
+  2.
+
+  schema: Install the schema required to run the test
+  rampup: Measure how long it takes to load a set of embeddings
+  search_and_index: Measure how the system responds to queries while it
+   is indexing recently ingested data.
+  search: Run vector search with a set of default (or overridden) parameters
+  search_and_rewrite: Run the same search operations as above, but while rewriting the data
+  search_and_invalidate: Run the same search operations as above, but while overwriting the data
+   with different content using the same vector did.
+  In all of these phases, it is important to instance the metrics with distinct names.
+  Also, aggregates of recall should include total aggregate as well as a moving average.
+  TEMPLATE(dimensions,1536)
+  TEMPLATE(trainsize,1000)
+  TEMPLATE(testsize,10000)
+
+
+scenarios:
+  astra_vectors:
+    schema: run tags='block:schema' labels='target:astra' threads===1 cycles===4
+    rampup: run tags='block:rampup' labels='target:astra' threads=100 cycles=TEMPLATE(trainsize) errors=counter
+    search_and_index_unthrottled: >-
+      run tags='block:search_and_index,optype=select' labels='target:astra'
+      cycles=TEMPLATE(testsize) threads=10 errors=counter,warn stride=500
+    search_and_index: >-
+      run alias=search_and_index tags='block:search_and_index,optype=select' labels='target:astra'
+      cycles=TEMPLATE(testsize), retry stride=100 striderate=17.5
+      errors=counter threads=500
+    search_and_rewrite: run tags='block:search_and_rewrite' labels='target:astra'
+    search_and_invalidate: run tags='block:search_and_invalidate' labels='target:astra'
+
+params:
+  driver: cqld4
+  instrument: true
+
+bindings:
+  id: ToString()
+  # This
+  test_floatlist: HdfFileToFloatList("TEMPLATE(dataset).hdf5", "/test"); ToCqlVector();
+  relevant_indices: HdfFileToIntArray("TEMPLATE(dataset).hdf5", "/neighbors")
+  distance_floatlist: HdfFileToFloatList("TEMPLATE(dataset).hdf5", "/distance")
+  train_floatlist: CqlVector(ListSizedHashed(<<dimensions:1536>>,HashRange(0.0f,1.0f))); NormalizeCqlVector();
+  synthetic_vectors: HashedFloatVectors(TEMPLATE(dimensions));
+  account_value: Hash(); <<valdist:Uniform(0,1000)->int>>; ToString() -> String
+  knowledge_value: Hash(); <<valdist:Uniform(0,20)->int>>; ToString() -> String
+
+blocks:
+  drop:
+    params:
+      cl: TEMPLATE(cl,LOCAL_QUORUM)
+      prepared: false
+    ops:
+      drop_index: |
+        DROP INDEX IF EXISTS TEMPLATE(keyspace,baselines).TEMPLATE(table,vectors);
+      drop_table: |
+        DROP TABLE IF EXISTS TEMPLATE(keyspace,baselines).TEMPLATE(table,vectors);
+  schema:
+    params:
+      cl: TEMPLATE(cl,LOCAL_QUORUM)
+      prepared: false
+    ops:
+      create_table: |
+        CREATE TABLE IF NOT EXISTS TEMPLATE(keyspace,baselines).TEMPLATE(table,vectors) (
+          id text,
+          account_sid text,
+          knowledge_sid text,
+          embedding vector<float,TEMPLATE(dimensions)>,
+          PRIMARY KEY ((account_sid), id)
+        ) WITH CLUSTERING ORDER BY (id ASC);
+      create_sai_index: |
+        CREATE CUSTOM INDEX IF NOT EXISTS ON TEMPLATE(keyspace,baselines).TEMPLATE(table,vectors) (embedding) USING 'StorageAttachedIndex'
+        WITH OPTIONS = {'similarity_function' : 'TEMPLATE(similarity_function,cosine)'};
+      create_knowledge_sid_index: |
+        CREATE CUSTOM INDEX IF NOT EXISTS ON TEMPLATE(keyspace,baselines).TEMPLATE(table,vectors) (knowledge_sid) USING 'StorageAttachedIndex';
+  rampup:
+    params:
+      cl: TEMPLATE(write_cl,LOCAL_QUORUM)
+      prepared: true
+    ops:
+      insert: |
+        INSERT INTO TEMPLATE(keyspace,baselines).TEMPLATE(table,vectors)
+        (id, account_sid, knowledge_sid, embedding) VALUES ({id},{account_value},{knowledge_value},{train_floatlist});
+  search_and_index:
+    ops:
+      select_ann_limit:
+        prepared: |
+          SELECT * FROM TEMPLATE(keyspace,baselines).TEMPLATE(table,vectors)
+          ORDER BY embedding ANN OF {test_floatlist} LIMIT TEMPLATE(select_limit,100);
+        tags:
+          optype: select
+        verifier-init: |
+          for (int k in List.of(100)) {
+            relevancy=new io.nosqlbench.nb.api.engine.metrics.wrappers.RelevancyMeasures(_parsed_op)
+            relevancy.addFunction(io.nosqlbench.engine.extensions.computefunctions.RelevancyFunctions.recall("recall",k));
+            relevancy.addFunction(io.nosqlbench.engine.extensions.computefunctions.RelevancyFunctions.precision("precision",k));
+            relevancy.addFunction(io.nosqlbench.engine.extensions.computefunctions.RelevancyFunctions.F1("F1",k));
+            relevancy.addFunction(io.nosqlbench.engine.extensions.computefunctions.RelevancyFunctions.reciprocal_rank("RR",k));
+            relevancy.addFunction(io.nosqlbench.engine.extensions.computefunctions.RelevancyFunctions.average_precision("AP",k));
+            windowed_relevancy = new io.nosqlbench.nb.api.engine.metrics.wrappers.WindowedRelevancyMeasures(_parsed_op,10);
+            windowed_relevancy.addFunction(io.nosqlbench.engine.extensions.computefunctions.RelevancyFunctions.recall("recall",k));
+          }
+        verifier: |
+          // driver-specific function
+          actual_indices=cql_utils.cqlStringColumnToIntArray("key",result);
+          // driver-agnostic function
+          relevancy.accept({relevant_indices},actual_indices);
+          // because we are "verifying" although this needs to be reorganized
+          windowed_relevancy.accept({relevant_indices},actual_indices);
+          return true;
+      insert_rewrite:
+        prepared: |
+          INSERT INTO TEMPLATE(keyspace,baselines).TEMPLATE(table,vectors)
+          (id, account_sid, knowledge_sid, embedding) VALUES ({id},{account_value},{knowledge_value},{train_floatlist});
+        tags:
+          optype: insert
+
+  search_and_rewrite:
+    ops:
+      select_ann_limit:
+        stmt: |
+          SELECT * FROM TEMPLATE(keyspace,baselines).TEMPLATE(table,vectors) ORDER BY embedding ANN OF {test_vector} LIMIT TEMPLATE(select_limit,100);
+        verifier-init: |
+          scriptingmetrics.newSummaryGauge(_parsed_op,"recall")
+      upsert_same:
+        stmt: |
+          INSERT INTO TEMPLATE(keyspace,baselines).TEMPLATE(table,vectors)
+          (id, account_sid, knowledge_sid, embedding) VALUES ({rw_key},{rw_key},{rw_key},{train_vector});
+  search_and_invalidate:
+    ops:
+      select_ann_limit:
+        stmt: |
+          SELECT * FROM TEMPLATE(keyspace,baselines).TEMPLATE(table,vectors) ORDER BY embedding ANN OF {test_vector} LIMIT TEMPLATE(select_limit,100);
+      upsert_random: |
+        INSERT INTO TEMPLATE(keyspace,baselines).TEMPLATE(table,vectors)
+        (id, account_sid, knowledge_sid, embedding) VALUES ({rw_key},{rw_key},{rw_key},{train_vector});
+
+
